@@ -5,6 +5,7 @@ import numpy as np
 from numpy.linalg import inv, norm
 import scipy.integrate
 from scipy.spatial.transform import Rotation
+import matplotlib.pyplot as plt
 
 class ExitStatus(Enum):
     """ Exit status values indicate the reason for simulation termination. """
@@ -16,7 +17,7 @@ class ExitStatus(Enum):
     OVER_SPIN    = 'Failure: Your quadrotor is out of control; it is spinning faster than 100 rad/s. The onboard IMU can only measure up to 52 rad/s (3000 deg/s).'
     FLY_AWAY     = 'Failure: Your quadrotor is out of control; it flew away with a position error greater than 20 meters.'
 
-def simulate(initial_state, quadrotor, controller, trajectory, t_final, terminate=None):
+def simulate(initial_state, quadrotor, controller, trajectory, t_final, terminate=None, vio = None, stereo = None):
     """
     Perform a quadrotor simulation and return the numerical results.
 
@@ -63,20 +64,36 @@ def simulate(initial_state, quadrotor, controller, trajectory, t_final, terminat
     initial_state = {k: np.array(v) for k, v in initial_state.items()}
 
     if terminate is None:    # Default exit. Terminate at final position of trajectory.
-        normal_exit = traj_end_exit(initial_state, trajectory)
+        if vio is None:
+            normal_exit = traj_end_exit(initial_state, trajectory, using_vio = False)
+        else:
+            normal_exit = traj_end_exit(initial_state, trajectory, using_vio = True)
     elif terminate is False: # Never exit before timeout.
         normal_exit = lambda t, s: None
     else:                    # Custom exit.
         normal_exit = terminate
 
     t_step = 1/500 # in seconds, determines control loop frequency
-
+    if vio is not None:
+        t_step = 1/vio.sampling_rate
+        print('Running VIO, reducing simulator to',1/t_step,' Hz!!!')
     time    = [0]
     state   = [copy.deepcopy(initial_state)]
+    images_feature = []
+    imu_measurements = []
+    vio_state = [copy.deepcopy(initial_state)]
     flat    = [sanitize_trajectory_dic(trajectory.update(time[-1]))]
     control = [sanitize_control_dic(controller.update(time[-1], state[-1], flat[-1]))]
 
     exit_status = None
+
+    # Initialize VIO 
+    if vio is not None and not vio.initialized:
+        state_dot = quadrotor.statedot(state[0], control[0]['cmd_motor_speeds'], t_step)
+        vio.initialize(state[0], state_dot, time[0])
+    if vio is not None and not stereo.initialized:
+        stereo.sample_features()
+
     while True:
         exit_status = exit_status or safety_exit(state[-1], flat[-1], control[-1])
         exit_status = exit_status or normal_exit(time[-1], state[-1])
@@ -86,13 +103,31 @@ def simulate(initial_state, quadrotor, controller, trajectory, t_final, terminat
         time.append(time[-1] + t_step)
         state.append(quadrotor.step(state[-1], control[-1]['cmd_motor_speeds'], t_step))
         flat.append(sanitize_trajectory_dic(trajectory.update(time[-1])))
-        control.append(sanitize_control_dic(controller.update(time[-1], state[-1], flat[-1])))
+        if vio is not None:
+            state_dot = quadrotor.statedot(state[-1], control[-1]['cmd_motor_speeds'], t_step)
+            state_estimated, image_feature, imu_measurement = vio.step(state[-1], state_dot, time[-1], stereo)
+            if image_feature is not None:
+                # meaning that the camera update is triggered
+                images_feature.append(image_feature.T)
+            imu_measurements.append(imu_measurement)
+            vio_state.append(state_estimated)
+            control.append(sanitize_control_dic(controller.update(time[-1], vio_state[-1], flat[-1])))
+        else:
+            control.append(sanitize_control_dic(controller.update(time[-1], state[-1], flat[-1])))
 
-    time    = np.array(time, dtype=np.float64)
+
+    time    = np.array(time, dtype=float)    
     state   = merge_dicts(state)
+    if vio is not None:
+        vio_state  = merge_dicts(vio_state)
     control = merge_dicts(control)
     flat    = merge_dicts(flat)
-    return (time, state, control, flat, exit_status)
+
+    if vio is not None:
+        return (time, state, vio_state, control, flat, exit_status, imu_measurements)
+    else:
+        return (time, state, control, flat, exit_status)
+
 
 def merge_dicts(dicts_in):
     """
@@ -132,7 +167,7 @@ def quat_dot(quat, omega):
     return quat_dot
 
 
-def traj_end_exit(initial_state, trajectory):
+def traj_end_exit(initial_state, trajectory, using_vio = False):
     """
     Returns a exit function. The exit function returns an exit status message if
     the quadrotor is near hover at the end of the provided trajectory. If the
@@ -153,8 +188,13 @@ def traj_end_exit(initial_state, trajectory):
         err_attitude = rotf * cur_attitude.inv() # Rotation between current and final
         angle = norm(err_attitude.as_rotvec()) # angle in radians from vertical
         # Success is reaching near-zero speed with near-zero position error.
-        if time >= min_time and norm(state['x'] - xf) < 0.02 and norm(state['v']) <= 0.03 and angle <= 0.02:
-            return ExitStatus.COMPLETE
+        if using_vio:
+            # set larger threshold for VIO due to noisy measurements
+            if time >= min_time and norm(state['x'] - xf) < 1 and norm(state['v']) <= 1 and angle <= 1:
+                return ExitStatus.COMPLETE
+        else:
+            if time >= min_time and norm(state['x'] - xf) < 0.02 and norm(state['v']) <= 0.03 and angle <= 0.02:
+                return ExitStatus.COMPLETE
         return None
     return exit_fn
 
@@ -186,20 +226,21 @@ def sanitize_control_dic(control_dic):
     """
     Return a sanitized version of the control dictionary where all of the elements are np arrays
     """
-    control_dic['cmd_motor_speeds'] = np.asarray(control_dic['cmd_motor_speeds'], np.float64).ravel()
-    control_dic['cmd_moment'] = np.asarray(control_dic['cmd_moment'], np.float64).ravel()
-    control_dic['cmd_q'] = np.asarray(control_dic['cmd_q'], np.float64).ravel()
+    control_dic['cmd_motor_speeds'] = np.asarray(control_dic['cmd_motor_speeds'], np.float).ravel()
+    control_dic['cmd_moment'] = np.asarray(control_dic['cmd_moment'], np.float).ravel()
+    control_dic['cmd_q'] = np.asarray(control_dic['cmd_q'], np.float).ravel()
     return control_dic
 
 def sanitize_trajectory_dic(trajectory_dic):
     """
     Return a sanitized version of the trajectory dictionary where all of the elements are np arrays
     """
-    trajectory_dic['x'] = np.asarray(trajectory_dic['x'], np.float64).ravel()
-    trajectory_dic['x_dot'] = np.asarray(trajectory_dic['x_dot'], np.float64).ravel()
-    trajectory_dic['x_ddot'] = np.asarray(trajectory_dic['x_ddot'], np.float64).ravel()
-    trajectory_dic['x_dddot'] = np.asarray(trajectory_dic['x_dddot'], np.float64).ravel()
-    trajectory_dic['x_ddddot'] = np.asarray(trajectory_dic['x_ddddot'], np.float64).ravel()
+    trajectory_dic['x'] = np.asarray(trajectory_dic['x'], np.float).ravel()
+    trajectory_dic['x_dot'] = np.asarray(trajectory_dic['x_dot'], np.float).ravel()
+    trajectory_dic['x_ddot'] = np.asarray(trajectory_dic['x_ddot'], np.float).ravel()
+    trajectory_dic['x_dddot'] = np.asarray(trajectory_dic['x_dddot'], np.float).ravel()
+    trajectory_dic['x_ddddot'] = np.asarray(trajectory_dic['x_ddddot'], np.float).ravel()
+
     return trajectory_dic
 
 class Quadrotor(object):
@@ -236,6 +277,33 @@ class Quadrotor(object):
         self.inv_inertia = inv(self.inertia)
         self.weight = np.array([0, 0, -self.mass*self.g])
 
+    def statedot(self, state, cmd_rotor_speeds, t_step):
+        """
+        Integrate dynamics forward from state given constant cmd_rotor_speeds for time t_step.
+        """
+
+        # The true motor speeds can not fall below min and max speeds.
+        rotor_speeds = np.clip(cmd_rotor_speeds, self.rotor_speed_min, self.rotor_speed_max)
+
+        # Compute individual rotor thrusts and net thrust and net moment.
+        rotor_thrusts = self.k_thrust * rotor_speeds**2
+        TM = self.to_TM @ rotor_thrusts
+        T = TM[0]
+        M = TM[1:4]
+
+        # Form autonomous ODE for constant inputs and integrate one time step.
+        def s_dot_fn(t, s):
+            return self._s_dot_fn(t, s, T, M)
+        s = Quadrotor._pack_state(state)
+        
+        s_dot = s_dot_fn(0, s)
+        v_dot = s_dot[3:6]
+        w_dot = s_dot[10:13]
+
+        state_dot = {'vdot': v_dot,'wdot': w_dot}
+        return state_dot 
+
+
     def step(self, state, cmd_rotor_speeds, t_step):
         """
         Integrate dynamics forward from state given constant cmd_rotor_speeds for time t_step.
@@ -254,8 +322,13 @@ class Quadrotor(object):
         def s_dot_fn(t, s):
             return self._s_dot_fn(t, s, T, M)
         s = Quadrotor._pack_state(state)
+        
+        # Option 1 - RK45 integration
         sol = scipy.integrate.solve_ivp(s_dot_fn, (0, t_step), s, first_step=t_step)
         s = sol['y'][:,-1]
+        # Option 2 - Euler integration
+        # s = s + s_dot_fn(0, s) * t_step  # first argument doesn't matter. It's time invariant model
+
         state = Quadrotor._unpack_state(s)
 
         # Re-normalize unit quaternion.
