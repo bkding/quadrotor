@@ -1,5 +1,5 @@
 import numpy as np
-
+from math import factorial
 from .graph_search import graph_search
 
 
@@ -22,254 +22,363 @@ class WorldTraj(object):
             goal,  xyz position in meters, shape=(3,)
         """
         # Path planning parameters.
-        self.resolution    = np.array([0.25, 0.25, 0.25]) # m
-        self.margin        = 0.40                         # m
-        self.clearance_max = 0.30                         # m
+        self.resolution = np.array([0.25, 0.25, 0.25]) # m
+        self.margins    = (0.45, 0.38, 0.30, 0.26)     # m, tried largest first
+        self.seg_max    = 12.0                         # m
+
+        # Speed limits.
+        self.v_max = 6.00 # m/s
+        self.v_nom = 4.20 # m/s, seed speed for the initial time allocation
+
+        # Vehicle constants.
+        self.mass            = 0.030    # kg
+        self.inertia         = (1.43e-5, 1.43e-5, 2.89e-5) # kg*m^2
+        self.arm_length      = 0.046    # m
+        self.k_thrust        = 2.3e-8   # N/(rad/s)**2
+        self.k_drag          = 7.8e-11  # N*m/(rad/s)**2
+        self.rotor_speed_max = 2500.0   # rad/s
+        self.actuator_frac   = 0.88
+        self.g               = 9.81     # m/s^2
+
+        # Rotor allocation and per-rotor force limit.
+        l, gamma = self.arm_length, self.k_drag / self.k_thrust
+        self.alloc_inv = np.linalg.inv(np.array([[1, 1, 1, 1],
+                                                 [0, l, 0, -l],
+                                                 [-l, 0, l, 0],
+                                                 [gamma, -gamma, gamma, -gamma]]))
+        self.f_rotor_max = (self.k_thrust * self.rotor_speed_max**2
+                            * self.actuator_frac)
+
+        # Polynomial basis and snap cost weights.
+        self.n_coef  = 8
+        self.basis_0 = np.array([self._basis(0.0, n) for n in range(self.n_coef)])
+        self.basis_1 = np.array([self._basis(1.0, n) for n in range(self.n_coef)])
+        self.Q_snap  = self._snap_gram(self.n_coef)
+
+        # Trajectory refinement loops.
+        self.dt_min         = 0.15 # s
+        self.n_time_iters   = 20   # gradient steps on the time ratios
+        self.n_insert_iters = 8
+        self.check_dt       = 0.02 # s, sampling step for collision checking
 
         # Dense path and sparse waypoints.
-        self.path, _ = graph_search(world, self.resolution, self.margin,
-                                    start, goal, astar=True)
-        self.points = self._prune_waypoints(world, self.path)
-        n_pts = self.points.shape[0]
+        self.path = self._plan_path(world, start, goal)
+        self.points, keep_idx = self._prune_waypoints(world, self.path)
 
-        # Per-segment profile.
-        seg_vmax, seg_amax, seg_t_scale, z_ratio, cl_extra = \
-            self._segment_profile(world, n_pts)
+        # Smoothed trajectory.
+        self._refine_waypoints(world, keep_idx)
 
-        # Corner velocities at interior waypoints.
-        v_wp, speeds = self._corner_velocities(
-            n_pts, seg_vmax, seg_amax, z_ratio, cl_extra)
-        a_wp = np.zeros((n_pts, 3))
 
-        # Waypoint arrival times.
-        self.t_waypoints = self._waypoint_times(
-            n_pts, speeds, seg_vmax, seg_amax, seg_t_scale)
+    def _plan_path(self, world, start, goal):
+        """ Dense path at the largest planning margin that still admits one. """
+        for margin in self.margins:
+            self.margin = margin
+            path, _ = graph_search(world, self.resolution, self.margin,
+                                   start, goal, astar=True)
+            if path is not None:
+                return path
 
-        # Quintic polynomial fit.
-        self.coeffs = self._fit_quintics(n_pts, v_wp, a_wp)
+        # Fallback to stationary path.
+        return np.vstack((start, start))
+
+
+    def _refine_waypoints(self, world, keep_idx):
+        """ Split colliding segments until the smoothed trajectory is clear. """
+        # Initial fit.
+        self.t_waypoints, self.coeffs = self._build(self.points)
+        bad_segs = self._colliding_segments(world)
+
+        # Iterative midpoint insertion.
+        for _ in range(self.n_insert_iters):
+            if not bad_segs:
+                break
+            inserted = self._insert_midpoints(keep_idx, bad_segs)
+            if inserted is None:
+                break
+            self.points, keep_idx = inserted
+            self.t_waypoints, self.coeffs = self._build(self.points)
+            bad_segs = self._colliding_segments(world)
+
+        # Dense-path fallback.
+        if bad_segs and self.path.shape[0] > 2:
+            self.points = self.path
+            self.t_waypoints, self.coeffs = self._build(self.points)
 
 
     def _prune_waypoints(self, world, path):
-        """ Greedy line-of-sight pruning: keep farthest collision-free hop. """
-        pruned = [path[0]]
-        if path.shape[0] > 2:
-            i = 0
-            while i < path.shape[0] - 1:
-                j_best = i + 1
-                for j in range(path.shape[0] - 1, i, -1):
-                    seg = np.vstack((path[i], path[j]))
-                    cols = world.path_collisions(seg, self.margin)
-                    if len(cols) == 0:
-                        j_best = j
-                        break
-                pruned.append(path[j_best])
-                i = j_best
-            return np.array(pruned)
-        else:
-            return path
+        """ Greedy line-of-sight pruning; also returns dense-path indices. """
+        if path.shape[0] <= 2:
+            return path, list(range(path.shape[0]))
 
-
-    def _segment_profile(self, world, n_pts):
-        """ Per-segment geometry, kinematic limits, and time scaling. """
-        # Base kinematic limits.
-        v_nom   = 2.65 # m/s
-        a_nom   = 8.8  # m/s^2
-        v_min   = 1.65 # m/s
-        v_max   = 3.35 # m/s
-        a_min   = 6.6  # m/s^2
-        t_scale = 0.79
-
-        # Clearance probing buffers beyond self.margin.
-        clearance_steps = (0.30, 0.20, 0.10, 0.0) # m
-
-        # Shaping gains.
-        kv_long = 0.54
-        kv_z    = 0.12
-        kv_turn = 0.18
-        kv_cl   = 0.07
-        ka_z    = 0.08
-        kt_z    = 0.06
-        kt_turn = 0.22
-        kt_cl   = 0.08
-
-        # Segment vectors and lengths.
-        seg_vecs    = self.points[1:] - self.points[:-1]
-        seg_lengths = np.linalg.norm(seg_vecs, axis=1)
-        valid       = seg_lengths > 1e-4
-
-        # Z-projection ratio and length saturation.
-        z_ratio = np.zeros(n_pts - 1)
-        z_ratio[valid] = np.abs(seg_vecs[valid, 2]) / seg_lengths[valid]
-        long_ratio = np.clip((seg_lengths - 1.5) / 4.0, 0.0, 1.0)
-
-        # Free-space clearance per segment.
-        cl_extra = np.zeros(n_pts - 1)
-        for i in range(n_pts - 1):
-            seg = np.vstack((self.points[i], self.points[i+1]))
-            for extra in clearance_steps:
-                if len(world.path_collisions(seg, self.margin + extra)) == 0:
-                    cl_extra[i] = extra
+        # Farthest collision-free hop from each kept node.
+        keep = [0]
+        i = 0
+        while i < path.shape[0] - 1:
+            j_best = i + 1
+            for j in range(path.shape[0] - 1, i, -1):
+                seg = np.vstack((path[i], path[j]))
+                if len(world.path_collisions(seg, self.margin)) == 0:
+                    j_best = j
                     break
-        cl_ratio = cl_extra / self.clearance_max
+            keep.append(j_best)
+            i = j_best
 
-        # Horizontality and turn severity.
-        h_ratio = 1.0 - z_ratio
-        turn_sev = np.zeros(n_pts - 1)
-        for i in range(1, n_pts - 1):
-            if seg_lengths[i-1] > 1e-4 and seg_lengths[i] > 1e-4:
-                dir_prev = seg_vecs[i-1] / seg_lengths[i-1]
-                dir_next = seg_vecs[i] / seg_lengths[i]
-                dot_turn = np.clip(np.dot(dir_prev, dir_next), -1.0, 1.0)
-                severity = 0.5 * (1.0 - dot_turn)
-                turn_sev[i-1] = max(turn_sev[i-1], severity)
-                turn_sev[i] = max(turn_sev[i], severity)
-        h_turn = turn_sev * h_ratio**1.2
-
-        # Per-segment v_max.
-        seg_vmax = v_nom * (1.0 + kv_long * h_ratio * long_ratio)
-        seg_vmax *= (1.0 - kv_z * z_ratio**1.5)
-        seg_vmax *= (1.0 - kv_turn * h_turn)
-        seg_vmax *= (0.93 + kv_cl * cl_ratio)
-        seg_vmax = np.clip(seg_vmax, v_min, v_max)
-
-        # Per-segment a_max.
-        seg_amax = a_nom * (1.0 - ka_z * z_ratio**1.2)
-        seg_amax = np.clip(seg_amax, a_min, a_nom)
-
-        # Per-segment time scale.
-        seg_t_scale = t_scale * (1.0 + kt_z * z_ratio**1.4)
-        seg_t_scale *= (1.0 + kt_turn * h_turn)
-        seg_t_scale *= (1.0 + kt_cl * (1.0 - cl_ratio))
-
-        return seg_vmax, seg_amax, seg_t_scale, z_ratio, cl_extra
+        keep = self._cap_spacing(path, keep)
+        return path[keep], keep
 
 
-    def _corner_velocities(self, n_pts, seg_vmax, seg_amax, z_ratio, cl_extra):
-        """ Heuristic speeds at interior waypoints; endpoints stay at rest. """
-        # Corner-speed shaping gains.
-        kc_z  = 0.10
-        kc_cl = 0.12
-
-        v_wp   = np.zeros((n_pts, 3))
-        speeds = np.zeros(n_pts)
-
-        for i in range(1, n_pts - 1):
-            # Adjacent segments.
-            seg_prev = self.points[i] - self.points[i-1]
-            seg_next = self.points[i+1] - self.points[i]
-            n_prev = np.linalg.norm(seg_prev)
-            n_next = np.linalg.norm(seg_next)
-
-            if n_prev > 1e-4 and n_next > 1e-4:
-                # Unit directions and turn cosine.
-                dir_prev = seg_prev / n_prev
-                dir_next = seg_next / n_next
-                dot_prod = np.dot(dir_prev, dir_next)
-
-                # Reachable speed from rest.
-                a_turn = min(seg_amax[i-1], seg_amax[i])
-                v_turn_limit = min(seg_vmax[i-1], seg_vmax[i])
-                s_prev = np.sqrt(a_turn * n_prev)
-                s_next = np.sqrt(a_turn * n_next)
-
-                # Turn-angle multiplier.
-                if dot_prod >= 0.9:
-                    multiplier = 1.0
-                elif dot_prod > 0:
-                    multiplier = 0.3 + 0.7 * dot_prod
-                else:
-                    multiplier = max(0.05, 0.2 + 0.15 * dot_prod)
-
-                # Verticality and clearance scaling.
-                z_turn = max(z_ratio[i-1], z_ratio[i])
-                cl_turn = min(cl_extra[i-1], cl_extra[i]) / self.clearance_max
-                multiplier *= (1.0 - kc_z * z_turn**1.3)
-                multiplier *= (0.88 + kc_cl * cl_turn)
-                corner_speed = min(v_turn_limit, s_prev, s_next) * multiplier
-                speeds[i] = corner_speed
-
-                # Bisector direction.
-                dir_v = (dir_prev + dir_next)
-                dir_n = np.linalg.norm(dir_v)
-                if dir_n > 1e-4:
-                    dir_v = dir_v / dir_n
-                else:
-                    dir_v = dir_next
-
-                v_wp[i] = dir_v * corner_speed
-
-        return v_wp, speeds
+    def _cap_spacing(self, path, keep):
+        """ Subdivide any hop longer than seg_max with dense-path nodes. """
+        capped = [keep[0]]
+        for idx_a, idx_b in zip(keep[:-1], keep[1:]):
+            # Evenly spaced dense-path nodes inside the hop.
+            n_sub = int(np.ceil(np.linalg.norm(path[idx_b] - path[idx_a]) / self.seg_max))
+            for k in range(1, n_sub):
+                idx_sub = idx_a + int(round((idx_b - idx_a) * k / n_sub))
+                if capped[-1] < idx_sub < idx_b:
+                    capped.append(idx_sub)
+            capped.append(idx_b)
+        return capped
 
 
-    def _waypoint_times(self, n_pts, speeds, seg_vmax, seg_amax, seg_t_scale):
-        """ Cumulative arrival times from trapezoidal/triangular speed profile. """
-        dt_min = 0.1 # s
+    def _insert_midpoints(self, keep_idx, bad_segs):
+        """ Reinsert a dense-path node inside every segment that clipped an obstacle. """
+        new_idx = []
+        added = False
+        for i, idx in enumerate(keep_idx[:-1]):
+            new_idx.append(idx)
+            if i not in bad_segs:
+                continue
+            idx_mid = (idx + keep_idx[i+1]) // 2
+            if idx < idx_mid < keep_idx[i+1]:
+                new_idx.append(idx_mid)
+                added = True
+        new_idx.append(keep_idx[-1])
 
-        t_waypoints = [0.0]
-        for i in range(1, n_pts):
-            # Segment endpoints and limits.
-            d = np.linalg.norm(self.points[i] - self.points[i-1])
-            v_start = speeds[i-1]
-            v_end = speeds[i]
-            v_max = seg_vmax[i-1]
-            a_max = seg_amax[i-1]
+        if not added:
+            return None
+        return self.path[new_idx], new_idx
 
-            # Triangular or trapezoidal speed profile.
-            v_peak = np.sqrt((v_start**2 + v_end**2)/2.0 + a_max * d)
-            if v_peak < v_max:
-                dt = (2*v_peak - v_start - v_end) / a_max
+
+    def _colliding_segments(self, world):
+        """ Indices of the segments whose sampled trajectory leaves free space. """
+        bad_segs = set()
+        for i in range(len(self.t_waypoints) - 1):
+            # Uniform samples across the segment.
+            t0, t1 = self.t_waypoints[i], self.t_waypoints[i+1]
+            n_samples = max(3, int(np.ceil((t1 - t0) / self.check_dt)))
+            seg_pts = np.array([self._evaluate(t, 1)[0]
+                                for t in np.linspace(t0, t1, n_samples)])
+            if len(world.path_collisions(seg_pts, self.margin)) > 0:
+                bad_segs.add(i)
+        return bad_segs
+
+
+    def _build(self, points):
+        """ Waypoint arrival times and polynomial coefficients. """
+        # Initial segment times.
+        T = np.maximum(np.linalg.norm(np.diff(points, axis=0), axis=1)
+                       / self.v_nom, self.dt_min)
+
+        # Time ratio optimization and global scaling.
+        T = self._optimize_ratios(points, T)
+        coeffs = self._min_snap(points, T)
+        T = T * self._global_scale(coeffs, T)
+        return np.concatenate(([0.0], np.cumsum(T))), coeffs
+
+
+    def _snap_cost(self, points, T):
+        """ Integrated squared snap of the optimal trajectory for these times. """
+        coeffs = self._min_snap(points, T)
+        return float(sum(np.sum(coeffs[i] * (self.Q_snap @ coeffs[i])) / T[i]**7
+                         for i in range(len(T))))
+
+
+    def _optimize_ratios(self, points, T):
+        """ Descend on the snap cost in the subspace that preserves total time. """
+        n_segs = len(T)
+        if n_segs < 2:
+            return T
+        t_total = T.sum()
+        t_slack = t_total - self.dt_min * n_segs
+        cost = self._snap_cost(points, T)
+        step = 0.25 * t_total / n_segs
+
+        for _ in range(self.n_time_iters):
+            # Finite-difference gradient.
+            h_probe = 1e-3 * t_total / n_segs
+            grad = np.empty(n_segs)
+            for i in range(n_segs):
+                T_probe = T - h_probe / (n_segs - 1)
+                T_probe[i] = T[i] + h_probe
+                grad[i] = (self._snap_cost(points, np.maximum(T_probe, self.dt_min))
+                           - cost) / h_probe
+            grad -= grad.mean()
+            grad_norm = np.linalg.norm(grad)
+            if grad_norm < 1e-9:
+                break
+
+            # Backtracking line search.
+            for _ in range(12):
+                T_try = np.maximum(T - step * grad / grad_norm, self.dt_min)
+                T_try_slack = T_try - self.dt_min
+                T_try = self.dt_min + T_try_slack * (t_slack / T_try_slack.sum())
+                cost_try = self._snap_cost(points, T_try)
+                if cost_try < cost:
+                    T, cost = T_try, cost_try
+                    step *= 1.4
+                    break
+                step *= 0.5
             else:
-                d_acc = (v_max**2 - v_start**2)/(2*a_max) + (v_max**2 - v_end**2)/(2*a_max)
-                t_cruise = max(0, d - d_acc) / v_max
-                dt = (v_max - v_start)/a_max + (v_max - v_end)/a_max + t_cruise
-
-            # Floor segment duration to bound peak acceleration.
-            dt = dt * seg_t_scale[i-1]
-            if dt < dt_min:
-                dt = dt_min
-            t_waypoints.append(t_waypoints[-1] + dt)
-
-        return np.array(t_waypoints)
+                break
+        return T
 
 
-    def _fit_quintics(self, n_pts, v_wp, a_wp):
-        """ Solve per-segment quintic polynomials matching p, v, a at endpoints. """
-        coeffs = np.zeros((6, n_pts - 1, 3))
-        for i in range(n_pts - 1):
-            # Segment endpoints.
-            T_seg = self.t_waypoints[i+1] - self.t_waypoints[i]
-            p0 = self.points[i]
-            p1 = self.points[i+1]
-            v0 = v_wp[i]
-            v1 = v_wp[i+1]
-            a0 = a_wp[i]
-            a1 = a_wp[i+1]
+    def _global_scale(self, coeffs, T):
+        """ Factor on every segment time that keeps the rotors inside their range. """
+        # Derivatives 0..4 sampled along every segment.
+        taus = np.linspace(0.0, 1.0, 60)
+        basis_rows = [np.array([self._basis(t, order) for t in taus]) for order in range(5)]
+        derivs = [np.vstack([basis_row @ coeffs[i] for i in range(len(T))])
+                  for basis_row in basis_rows]
+        T_rep = np.repeat(T, len(taus))[:, None]
 
-            # Lower-order coefficients.
-            c0 = p0
-            c1 = v0
-            c2 = a0 / 2.0
+        def exceeds_limits(scale):
+            if np.linalg.norm(derivs[1] / (T_rep * scale), axis=1).max() > self.v_max:
+                return True
+            f_thrust, moment = self._flat_inputs(derivs[2] / (T_rep * scale)**2,
+                                                 derivs[3] / (T_rep * scale)**3,
+                                                 derivs[4] / (T_rep * scale)**4)
+            f_rotor = np.einsum('rc,nc->nr', self.alloc_inv,
+                                np.column_stack([f_thrust, moment]))
+            return bool(f_rotor.max() > self.f_rotor_max or f_rotor.min() < 0.0)
 
-            # Higher-order coefficients via 3x3 solve.
-            A = np.array([
-                [T_seg**3, T_seg**4, T_seg**5],
-                [3*T_seg**2, 4*T_seg**3, 5*T_seg**4],
-                [6*T_seg, 12*T_seg**2, 20*T_seg**3]
-            ])
-            B = np.array([
-                p1 - (c0 + c1*T_seg + c2*T_seg**2),
-                v1 - (c1 + 2*c2*T_seg),
-                a1 - (2*c2)
-            ])
-            sol = np.linalg.solve(A, B)
-            coeffs[0, i] = c0
-            coeffs[1, i] = c1
-            coeffs[2, i] = c2
-            coeffs[3, i] = sol[0]
-            coeffs[4, i] = sol[1]
-            coeffs[5, i] = sol[2]
+        # Log-space bisection.
+        scale_lo, scale_hi = 1e-3, 1e3
+        if not exceeds_limits(scale_lo):
+            return scale_lo
+        for _ in range(60):
+            scale_mid = np.sqrt(scale_lo * scale_hi)
+            if exceeds_limits(scale_mid):
+                scale_lo = scale_mid
+            else:
+                scale_hi = scale_mid
+        return scale_hi
 
-        return coeffs
+
+    def _flat_inputs(self, x_ddot, x_dddot, x_ddddot):
+        """ Collective thrust and body moment the flat outputs demand. """
+        # Desired force and body axes.
+        F_des = self.mass * (x_ddot + np.array([0.0, 0.0, self.g]))
+        F_des_norm = np.maximum(np.linalg.norm(F_des, axis=1), 1e-9)
+        b_3_des = F_des / F_des_norm[:, None]
+        a_yaw = np.array([1.0, 0.0, 0.0])
+        b_2_raw = np.cross(b_3_des, a_yaw)
+        b_2_raw_norm = np.maximum(np.linalg.norm(b_2_raw, axis=1), 1e-9)
+        b_2_des = b_2_raw / b_2_raw_norm[:, None]
+        b_1_des = np.cross(b_2_des, b_3_des)
+
+        # Roll and pitch rates.
+        F_des_dot, F_des_ddot = self.mass * x_dddot, self.mass * x_ddddot
+        F_des_norm_dot = np.sum(F_des_dot * b_3_des, axis=1)
+        w_x = -np.sum(F_des_dot * b_2_des, axis=1) / F_des_norm
+        w_y = np.sum(F_des_dot * b_1_des, axis=1) / F_des_norm
+
+        # Yaw rate.
+        b_3_des_dot = (F_des_dot - F_des_norm_dot[:, None] * b_3_des) / F_des_norm[:, None]
+        b_2_raw_dot = np.cross(b_3_des_dot, a_yaw)
+        b_2_des_dot = ((b_2_raw_dot - np.sum(b_2_raw_dot * b_2_des, axis=1)[:, None] * b_2_des)
+                       / b_2_raw_norm[:, None])
+        b_1_des_dot = np.cross(b_2_des_dot, b_3_des) + np.cross(b_2_des, b_3_des_dot)
+        w_z = np.sum(b_2_des * b_1_des_dot, axis=1)
+
+        # Roll and pitch angular accelerations.
+        w_y_dot = (np.sum(F_des_ddot * b_1_des, axis=1)
+                   - 2 * F_des_norm_dot * w_y - F_des_norm * w_z * w_x) / F_des_norm
+        w_x_dot = (-np.sum(F_des_ddot * b_2_des, axis=1)
+                   - 2 * F_des_norm_dot * w_x + F_des_norm * w_z * w_y) / F_des_norm
+
+        # Body moment; yaw angular acceleration dropped.
+        w_des = np.column_stack([w_x, w_y, w_z])
+        w_des_dot = np.column_stack([w_x_dot, w_y_dot, np.zeros_like(w_x_dot)])
+        inertia_diag = np.array(self.inertia)
+        return F_des_norm, w_des_dot * inertia_diag + np.cross(w_des, w_des * inertia_diag)
+
+
+    @staticmethod
+    def _snap_gram(n_coef):
+        """ Integral of the squared 4th derivative over normalised time in [0,1]. """
+        Q = np.zeros((n_coef, n_coef))
+        for j in range(4, n_coef):
+            for k in range(4, n_coef):
+                Q[j, k] = (factorial(j) / factorial(j - 4)
+                           * factorial(k) / factorial(k - 4) / (j + k - 7))
+        return Q
+
+
+    def _basis(self, tau, order):
+        """ Row of d^order/dtau^order for the monomial basis at tau. """
+        basis_row = np.zeros(self.n_coef)
+        for k in range(order, self.n_coef):
+            mult = 1.0
+            for i in range(order):
+                mult *= (k - i)
+            basis_row[k] = mult * tau ** (k - order)
+        return basis_row
+
+
+    def _min_snap(self, points, T):
+        """ Minimum-snap trajectory as a square linear solve. """
+        # Constraint system.
+        n_segs = len(T)
+        n_coef = self.n_coef
+        n_unknowns = n_coef * n_segs
+        A = np.zeros((n_unknowns, n_unknowns))
+        B = np.zeros((n_unknowns, 3))
+        row = 0
+
+        # Waypoint constraints.
+        for i in range(n_segs):
+            A[row, n_coef*i:n_coef*(i+1)] = self.basis_0[0]
+            B[row] = points[i]
+            row += 1
+            A[row, n_coef*i:n_coef*(i+1)] = self.basis_1[0]
+            B[row] = points[i+1]
+            row += 1
+
+        # Endpoint rest constraints.
+        for order in range(1, 4):
+            A[row, 0:n_coef] = self.basis_0[order] / T[0]**order
+            row += 1
+            A[row, n_coef*(n_segs-1):n_coef*n_segs] = self.basis_1[order] / T[-1]**order
+            row += 1
+
+        # Continuity of derivatives 1..6 across interior knots.
+        for i in range(1, n_segs):
+            for order in range(1, 7):
+                A[row, n_coef*(i-1):n_coef*i] = self.basis_1[order] / T[i-1]**order
+                A[row, n_coef*i:n_coef*(i+1)] = -self.basis_0[order] / T[i]**order
+                row += 1
+
+        return np.linalg.solve(A, B).reshape(n_segs, n_coef, 3)
+
+
+    def _evaluate(self, t, n_orders=5):
+        """ Position and the first n_orders-1 derivatives at time t. """
+        # Hold start/end outside the trajectory window.
+        if t <= self.t_waypoints[0]:
+            return self.points[0], *(np.zeros((n_orders - 1, 3)))
+        if t >= self.t_waypoints[-1]:
+            return self.points[-1], *(np.zeros((n_orders - 1, 3)))
+
+        # Segment index and normalized time.
+        idx = np.searchsorted(self.t_waypoints, t, side='right') - 1
+        idx = max(0, min(self.coeffs.shape[0] - 1, idx))
+        T_seg = self.t_waypoints[idx+1] - self.t_waypoints[idx]
+        tau = (t - self.t_waypoints[idx]) / T_seg
+        c = self.coeffs[idx]
+
+        return tuple((self._basis(tau, order) @ c) / T_seg**order for order in range(n_orders))
 
 
     def update(self, t):
@@ -288,45 +397,11 @@ class WorldTraj(object):
                 yaw,      yaw angle, rad
                 yaw_dot,  yaw rate, rad/s
         """
-        x        = np.zeros((3,))
-        x_dot    = np.zeros((3,))
-        x_ddot   = np.zeros((3,))
-        x_dddot  = np.zeros((3,))
-        x_ddddot = np.zeros((3,))
-        yaw      = 0.5
-        yaw_dot  = 0
-
-        # Hold start/end outside the trajectory window.
-        if t <= self.t_waypoints[0]:
-            x = self.points[0]
-        elif t >= self.t_waypoints[-1]:
-            x = self.points[-1]
-        else:
-            # Segment index and local time.
-            idx = np.searchsorted(self.t_waypoints, t, side='right') - 1
-            idx = max(0, min(self.points.shape[0] - 2, idx))
-            t_seg = t - self.t_waypoints[idx]
-            c = self.coeffs[:, idx, :]
-
-            # Time powers.
-            t2 = t_seg * t_seg
-            t3 = t2 * t_seg
-            t4 = t3 * t_seg
-            t5 = t4 * t_seg
-
-            # Polynomial basis and derivatives.
-            basis = np.array([
-                [1, t_seg, t2,    t3,      t4,       t5],
-                [0, 1,     2*t_seg, 3*t2,  4*t3,     5*t4],
-                [0, 0,     2,     6*t_seg, 12*t2,    20*t3],
-                [0, 0,     0,     6,       24*t_seg, 60*t2],
-                [0, 0,     0,     0,       24,       120*t_seg],
-            ])
-            x, x_dot, x_ddot, x_dddot, x_ddddot = basis @ c
+        x, x_dot, x_ddot, x_dddot, x_ddddot = self._evaluate(t)
 
         flat_output = {
             'x': x, 'x_dot': x_dot, 'x_ddot': x_ddot,
             'x_dddot': x_dddot, 'x_ddddot': x_ddddot,
-            'yaw': yaw, 'yaw_dot': yaw_dot,
+            'yaw': 0.0, 'yaw_dot': 0.0,
         }
         return flat_output
