@@ -37,6 +37,9 @@ class SE3Control(object):
         self.K_R = np.diag([460.0, 460.0, 48.0])
         self.K_w = np.diag([29.0, 29.0, 26.0])
 
+        # Desired angular velocity cap.
+        self.w_des_max = 8.0 # rad/s
+
 
     def update(self, t, state, flat_output):
         """
@@ -66,10 +69,10 @@ class SE3Control(object):
                 cmd_moment, N*m (for debugging; not used by simulator)
                 cmd_q, quaternion [i,j,k,w] (for laboratory; not used by simulator)
         """
-        cmd_motor_speeds = np.zeros((4,))
+        cmd_motor_speeds = np.zeros(4)
         cmd_thrust = 0
-        cmd_moment = np.zeros((3,))
-        cmd_q = np.zeros((4,))
+        cmd_moment = np.zeros(3)
+        cmd_q = np.zeros(4)
 
         # STUDENT CODE HERE
         # Current state.
@@ -82,8 +85,10 @@ class SE3Control(object):
         x_des = flat_output['x']
         x_dot_des = flat_output['x_dot']
         x_ddot_des = flat_output['x_ddot']
+        x_dddot_des = flat_output['x_dddot']
         yaw_des = flat_output['yaw']
-        
+        yaw_dot_des = flat_output['yaw_dot']
+
         # Desired translational acceleration command.
         x_ddot_cmd = (x_ddot_des
                       - self.K_d @ (v - x_dot_des)
@@ -111,13 +116,30 @@ class SE3Control(object):
         b_2_raw = np.cross(b_3_des, a_yaw)
         b_2_raw_norm = np.linalg.norm(b_2_raw)
         if b_2_raw_norm < 1e-6:
-            b_2_raw = np.cross(b_3_des, np.array([1.0, 0.0, 0.0]).T)
-            b_2_raw_norm = np.linalg.norm(b_2_raw)
-        b_2_des = b_2_raw / b_2_raw_norm
+            b_2_fallback = np.cross(b_3_des, np.array([1.0, 0.0, 0.0]).T)
+            b_2_des = b_2_fallback / np.linalg.norm(b_2_fallback)
+        else:
+            b_2_des = b_2_raw / b_2_raw_norm
 
         # Desired rotation matrix.
         b_1_des = np.cross(b_2_des, b_3_des)
         R_des = np.column_stack((b_1_des, b_2_des, b_3_des))
+
+        # Desired angular velocity from jerk and yaw rate.
+        if b_2_raw_norm >= 1e-6 and F_des_norm >= 1e-6:
+            F_des_dot = self.mass * x_dddot_des
+            b_3_des_dot = (F_des_dot - (b_3_des @ F_des_dot) * b_3_des) / F_des_norm
+
+            a_yaw_dot = yaw_dot_des * np.array([-np.sin(yaw_des), np.cos(yaw_des), 0.0]).T
+            b_2_raw_dot = np.cross(b_3_des_dot, a_yaw) + np.cross(b_3_des, a_yaw_dot)
+            b_2_des_dot = (b_2_raw_dot - (b_2_des @ b_2_raw_dot) * b_2_des) / b_2_raw_norm
+
+            w_des = np.array([-b_3_des_dot @ b_2_des,
+                              b_3_des_dot @ b_1_des,
+                              b_2_des @ np.cross(b_2_des_dot, b_3_des)])
+            w_des = np.clip(w_des, -self.w_des_max, self.w_des_max)
+        else:
+            w_des = np.zeros(3)
 
         # Attitude and angular velocity errors.
         e_R_matrix = 0.5 * (R_des.T @ R - R.T @ R_des)
@@ -125,7 +147,7 @@ class SE3Control(object):
                         e_R_matrix[0, 2],
                         e_R_matrix[1, 0]])
 
-        e_w = w
+        e_w = w - R.T @ R_des @ w_des
         u_2 = self.inertia @ (-self.K_R @ e_R - self.K_w @ e_w)
 
         # Rotor force allocation.
